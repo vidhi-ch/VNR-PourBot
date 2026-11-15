@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 pour.mp4
 venv311/venv/
+venv/
