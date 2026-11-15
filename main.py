@@ -2,6 +2,8 @@
 UR5 + Robotiq 2F-140: pick a source container, pour liquid (SPH) into a target container,
 put the source container back.  Circular ring table, robot on a central pedestal (Genesis).
 
+Containers: BOTTLE (source) -> GLASS (target)
+
 Run:   python main.py                      (viewer window, default layout)
        python main.py --check              (only plan + reachability check, no Genesis needed)
        python main.py --src 0.55 -22 --tgt 0.55 22      (polar: radius [m], angle [deg])
@@ -122,19 +124,20 @@ DEF_TGT = SimpleNamespace(lip=None, grasp=None, pad_d=None, fing_closed=None, ti
 
 def smooth(s): return s**3*(10 - 15*s + 6*s*s)
 
-def plan(src_xy, tgt_xy, S=None, T=None, flip=1, tilt_deg=None, tilt_fast_deg=58, lift=0.12, pour_dy=None, pre_back=0.09):
+def plan(src_xy, tgt_xy, S=None, T=None, flip=1, tilt_deg=None, tilt_fast_deg=58, lift=0.12, pour_dy=None, pre_back=0.09, pour_clear=None):
     """Cartesian plan (frames). Pour direction u = source->target. Cup yaw so cup +y (spout) = u.
     S/T = source/target spec objects (default: the cup and target defined above)."""
     S = S or DEF_SRC; T = T or DEF_TGT
     lip, grasp, pad_d, fing_closed = S.lip, S.grasp, S.pad_d, S.fing_closed
     tilt_deg = S.tilt if tilt_deg is None else tilt_deg
     if pour_dy is None: pour_dy = -0.6*T.open_r
+    if pour_clear is None: pour_clear = 0.10 if (T and T.H > 0.15) else POUR_CLEAR
     src_xy, tgt_xy = np.asarray(src_xy, float), np.asarray(tgt_xy, float)
     u = (tgt_xy - src_xy) / np.linalg.norm(tgt_xy - src_xy)
     I = R.from_euler("z", np.arctan2(u[1], u[0]) - np.pi/2).as_matrix()
     R_CUP_G = np.column_stack([[0,0,flip], [flip,0,0], [0,1,0]])   # gripper x,y,z axes in cup frame
     O_src = np.array([*src_xy, TOP + CUP_GAP]); O_lift = O_src + [0,0,lift]
-    P_pour = np.array([*(tgt_xy + u*pour_dy), TOP + T.H + POUR_CLEAR])
+    P_pour = np.array([*(tgt_xy + u*pour_dy), TOP + T.H + pour_clear])
     def tilt_pose(th):
         Rc = I @ R.from_euler("x", -th).as_matrix(); return P_pour - Rc @ lip, Rc
     O_pour, _ = tilt_pose(0.0)
@@ -212,12 +215,12 @@ def solve_plan(F, stride=4):
     jump = np.abs(np.diff(qs, axis=0)).max()
     return Q, np.array(errs), q_home, jump
 
-def make_plan(src_xy, tgt_xy, S=None, T=None, pour_dy=None):
+def make_plan(src_xy, tgt_xy, S=None, T=None, pour_dy=None, pour_clear=None):
     """try both gripper roll variants, return the first that is reachable -> (F, Q, q_home)"""
     last = ""
     for flip in (1, -1):
         try:
-            F = plan(src_xy, tgt_xy, S, T, flip=flip, pour_dy=pour_dy)
+            F = plan(src_xy, tgt_xy, S, T, flip=flip, pour_dy=pour_dy, pour_clear=pour_clear)
             Q, errs, q_home, jump = solve_plan(F)
         except RuntimeError as e:
             last = str(e); continue
@@ -266,28 +269,94 @@ def table_urdf(path, n=48):
 
 # ============================ simulation ============================
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--src", nargs=2, type=float, metavar=("R", "DEG")); ap.add_argument("--tgt", nargs=2, type=float, metavar=("R", "DEG"))
-    ap.add_argument("--pour-dy", type=float, default=POUR_DY)
-    ap.add_argument("--check", action="store_true"); ap.add_argument("--tune", action="store_true")
-    ap.add_argument("--record", action="store_true"); ap.add_argument("--no-viewer", action="store_true")
+    ap = argparse.ArgumentParser(description="UR5 Container Pouring Simulation")
+    ap.add_argument("--src", nargs=2, type=float, metavar=("R", "DEG"))
+    ap.add_argument("--tgt", nargs=2, type=float, metavar=("R", "DEG"))
+    ap.add_argument("--pair", type=str, choices=["bottle_to_glass", "glass_to_bottle", "bottle_to_bottle", "glass_to_glass"],
+                    help="Container pair: bottle_to_glass, glass_to_bottle, bottle_to_bottle, glass_to_glass")
+    ap.add_argument("--src-type", type=str, choices=["bottle", "glass"], help="Source container type")
+    ap.add_argument("--tgt-type", type=str, choices=["bottle", "glass"], help="Target container type")
+    ap.add_argument("--pour-dy", type=float, default=None, help="Spout-lip offset from target center (default: auto)")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--tune", action="store_true")
+    ap.add_argument("--record", action="store_true")
+    ap.add_argument("--no-viewer", action="store_true")
     a = ap.parse_args()
+
+    # ---- Determine container pair ----
+    from containers import SPECS, write_urdf
+
+    src_kind, tgt_kind = None, None
+    if a.src_type and a.tgt_type:
+        src_kind, tgt_kind = a.src_type, a.tgt_type
+    elif a.pair:
+        src_kind, tgt_kind = a.pair.split("_to_")
+    elif sys.stdin.isatty():
+        print("\n" + "="*50)
+        print("  Select Pouring Configuration:")
+        print("  1) Bottle -> Glass")
+        print("  2) Glass -> Bottle")
+        print("  3) Bottle -> Bottle")
+        print("  4) Glass -> Glass")
+        print("="*50)
+        choice = input("Enter choice [1-4] (default 1): ").strip().lower()
+        pair_map = {
+            "1": ("bottle", "glass"),
+            "2": ("glass", "bottle"),
+            "3": ("bottle", "bottle"),
+            "4": ("glass", "glass"),
+            "bottle to glass": ("bottle", "glass"),
+            "glass to bottle": ("glass", "bottle"),
+            "bottle to bottle": ("bottle", "bottle"),
+            "glass to glass": ("glass", "glass"),
+            "bottle_to_glass": ("bottle", "glass"),
+            "glass_to_bottle": ("glass", "bottle"),
+            "bottle_to_bottle": ("bottle", "bottle"),
+            "glass_to_glass": ("glass", "glass"),
+        }
+        src_kind, tgt_kind = pair_map.get(choice, ("bottle", "glass"))
+    else:
+        src_kind, tgt_kind = "bottle", "glass"
+
+    S_spec = SPECS[src_kind]
+    T_spec = SPECS[tgt_kind]
+
     src = polar(*(a.src or SOURCE_POLAR)); tgt = polar(*(a.tgt or TARGET_POLAR))
-    for nm, p in (("source", src), ("target", tgt)):
+    for nm, p, sp in (("source", src, S_spec), ("target", tgt, T_spec)):
         r = np.hypot(*p)
-        if not (TABLE_INNER_RADIUS + CUP_R < r < TABLE_OUTER_RADIUS - TGT_R + 0.02):
+        if not (TABLE_INNER_RADIUS + sp.R < r < TABLE_OUTER_RADIUS - sp.R + 0.02):
             print(f"warning: {nm} at r={r:.2f} m is near the table edge / hole")
     if not URDF_PATH.exists(): sys.exit(f"URDF not found: {URDF_PATH}")
-    print(f"source {np.round(src,3)}  target {np.round(tgt,3)}  | finger_joint closed = {FING_CLOSED:.3f} rad, pad depth {PAD_D:.3f} m")
+
+    # Color themes
+    colors = {
+        "bottle": {"rgba": "0.2 0.5 0.9 0.8", "rgb": (0.2, 0.5, 0.9)},       # blue
+        "glass":  {"rgba": "0.85 0.9 0.95 0.5", "rgb": (0.85, 0.9, 0.95)},   # glass
+    }
+    s_rgba = colors[src_kind]["rgba"]
+    s_rgb = colors[src_kind]["rgb"]
+    if src_kind == tgt_kind:
+        # Give target a contrasting green tint if same type
+        if tgt_kind == "bottle":
+            t_rgba, t_rgb = "0.2 0.7 0.3 0.8", (0.2, 0.7, 0.3)
+        else:
+            t_rgba, t_rgb = "0.95 0.8 0.6 0.5", (0.95, 0.8, 0.6)
+    else:
+        t_rgba = colors[tgt_kind]["rgba"]
+        t_rgb = colors[tgt_kind]["rgb"]
+
+    print(f"source: {src_kind.upper()} at {np.round(src,3)} | target: {tgt_kind.upper()} at {np.round(tgt,3)}")
+    print(f"finger_joint closed = {S_spec.fing_closed:.3f} rad, pad depth {S_spec.pad_d:.3f} m, max tilt = {S_spec.tilt} deg")
     print("planning + IK (can take up to a minute) ...")
-    F, Q, q_home = make_plan(src, tgt, pour_dy=a.pour_dy)
+    pour_dy = a.pour_dy if a.pour_dy is not None else -0.6 * T_spec.open_r
+    F, Q, q_home = make_plan(src, tgt, S=S_spec, T=T_spec, pour_dy=pour_dy)
     print(f"plan OK: all poses reachable"); check_limits(Q)
     if a.check: return
 
     import genesis as gs
     GEN.mkdir(exist_ok=True)
-    container_urdf(GEN/"source_cup.urdf", "source_cup", CUP_R, CUP_H, CUP_WALL, CUP_BOT, "0.9 0.15 0.15 1")
-    container_urdf(GEN/"target_cup.urdf", "target_cup", TGT_R, TGT_H, TGT_WALL, TGT_BOT, "0.2 0.7 0.3 1")
+    write_urdf(GEN/"source_container.urdf", S_spec, rgba=s_rgba, name="source_container")
+    write_urdf(GEN/"target_container.urdf", T_spec, rgba=t_rgba, name="target_container")
     table_urdf(GEN/"ring_table.urdf")
     try: gs.init(backend=gs.gpu)
     except Exception as e: print("gs.init note:", e)
@@ -306,12 +375,14 @@ def main():
     for i in range(NUMBER_OF_LEGS):
         ang = 2*np.pi*i/NUMBER_OF_LEGS
         scene.add_entity(gs.morphs.Cylinder(radius=LEG_RADIUS, height=leg_h, pos=(LEG_DISTANCE*np.cos(ang), LEG_DISTANCE*np.sin(ang), leg_h/2), fixed=True))
-    scene.add_entity(gs.morphs.URDF(file=str(GEN/"target_cup.urdf"), pos=(*tgt, TOP), fixed=True), surface=gs.surfaces.Default(color=(0.2,0.7,0.3)))
+    # target container (fixed on table)
+    scene.add_entity(gs.morphs.URDF(file=str(GEN/"target_container.urdf"), pos=(*tgt, TOP), fixed=True), surface=gs.surfaces.Default(color=t_rgb))
     robot = scene.add_entity(gs.morphs.URDF(file=str(URDF_PATH), pos=tuple(BASE), fixed=True))
-    cup = scene.add_entity(gs.morphs.URDF(file=str(GEN/"source_cup.urdf"), pos=(*src, TOP + CUP_GAP), fixed=False),
-                           surface=gs.surfaces.Default(color=(0.9,0.15,0.15)))
-    side = 0.058
-    liquid = scene.add_entity(morph=gs.morphs.Box(pos=(*src, TOP + CUP_GAP + CUP_BOT + 0.004 + side/2), size=(side, side, side)),
+    # source container (picked and poured)
+    cup = scene.add_entity(gs.morphs.URDF(file=str(GEN/"source_container.urdf"), pos=(*src, TOP + CUP_GAP), fixed=False),
+                           surface=gs.surfaces.Default(color=s_rgb))
+    fx, fy, fh = S_spec.fill
+    liquid = scene.add_entity(morph=gs.morphs.Box(pos=(*src, TOP + CUP_GAP + S_spec.bottom + 0.004 + fh/2), size=(fx, fy, fh)),
                               material=gs.materials.SPH.Liquid(), surface=gs.surfaces.Default(color=(0.4,0.8,1.0), vis_mode="particle"))
     cam = None
     if RECORD or a.record:
@@ -355,9 +426,9 @@ def main():
         return Qp[i, :6] - q                                                      # tracking error
 
     u = (tgt - src)/np.linalg.norm(tgt - src)
-    in_tgt = lambda p: (np.hypot(p[:,0]-tgt[0], p[:,1]-tgt[1]) < TGT_R - TGT_WALL) & (p[:,2] > TOP - 0.01) & (p[:,2] < TOP + TGT_H + 0.02)
+    in_tgt = lambda p: (np.hypot(p[:,0]-tgt[0], p[:,1]-tgt[1]) < T_spec.open_r) & (p[:,2] > TOP - 0.01) & (p[:,2] < TOP + T_spec.H + 0.02)
     def cup_mask(p, O, Rc):
-        l = (p - O) @ Rc; return (np.hypot(l[:,0], l[:,1]) < CUP_R) & (l[:,2] > 0) & (l[:,2] < CUP_H + 0.03)
+        l = (p - O) @ Rc; return (np.hypot(l[:,0], l[:,1]) < S_spec.R) & (l[:,2] > 0) & (l[:,2] < S_spec.H + 0.03)
 
     idx = lambda ph: [i for i, f in enumerate(F) if f["phase"] == ph]
     carry_end, hold_end = idx("carry")[-1], idx("hold")[-1]
@@ -381,14 +452,14 @@ def main():
 
     def summarize(res):
         pe, ph = res["p_end"], res["p_hold"]
-        t = in_tgt(pe); c = (np.hypot(pe[:,0]-src[0], pe[:,1]-src[1]) < 0.07) & (pe[:,2] > TOP - 0.01) & ~t
+        t = in_tgt(pe); c = (np.hypot(pe[:,0]-src[0], pe[:,1]-src[1]) < S_spec.R) & (pe[:,2] > TOP - 0.01) & ~t
         out = (np.hypot(ph[:,0]-tgt[0], ph[:,1]-tgt[1]) < 0.30) & ~cup_mask(ph, *res["cup_hold"])
         err_u = float(((ph[out,:2] - tgt) @ u).mean()) if out.sum() > 20 else 0.0
         return dict(tgt=100*t.mean(), cup=100*c.mean(), spill=100*(1-t.mean()-c.mean()), kept=100*res.get("kept", np.nan), err_u=err_u)
     def show(dy, s): print(f"POUR_DY={dy:+.3f} | in TARGET {s['tgt']:.0f}% | left in source {s['cup']:.0f}% | spilled {s['spill']:.0f}% | "
                            f"kept during carry {s['kept']:.0f}% | landing offset along pour dir {1000*s['err_u']:+.0f} mm")
 
-    dy = a.pour_dy
+    dy = pour_dy
     if a.tune and particles() is not None:
         for k in range(3):
             res = run_once(F, Q)
@@ -396,7 +467,7 @@ def main():
             s = summarize(res); print(f"trial {k+1}:", end=" "); show(dy, s)
             if s["tgt"] >= 95: break
             dy = float(np.clip(dy - 0.8*s["err_u"], -0.15, 0.05))
-            F, Q, q_home = make_plan(src, tgt, pour_dy=dy); check_limits(Q)
+            F, Q, q_home = make_plan(src, tgt, S=S_spec, T=T_spec, pour_dy=dy); check_limits(Q)
             carry_end, hold_end = idx("carry")[-1], idx("hold")[-1]
         print("using POUR_DY =", round(dy, 3))
     res = run_once(F, Q, record=True)

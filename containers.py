@@ -26,7 +26,7 @@ SPECS = {
                    fill=(0.050, 0.050, 0.070), tilt=140, neck_r=0.030, neck_h=0.07),
 }
 
-def write_urdf(path, S, n=20, rgba="0.7 0.9 1 1"):
+def write_urdf(path, S, n=20, rgba="0.7 0.9 1 1", name=None):
     def geo(g, xyz, rp):
         o = f'<origin xyz="{_f(xyz)}" rpy="{_f(rp)}"/>'
         return (f'<visual>{o}<geometry>{g}</geometry><material name="m"><color rgba="{rgba}"/></material></visual>'
@@ -47,4 +47,5 @@ def write_urdf(path, S, n=20, rgba="0.7 0.9 1 1"):
         s += ring(S.neck_r, S.neck_wall, S.neck_h, S.H_body + S.neck_h/2, 16)
     inert = (f'<inertial><origin xyz="0 0 {S.H/3:.4f}"/><mass value="0.25"/>'
              '<inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/></inertial>')
-    path.write_text(f'<?xml version="1.0"?>\n<robot name="{S.kind}"><link name="base">{inert}{s}</link></robot>\n')
+    robot_name = name or S.kind
+    path.write_text(f'<?xml version="1.0"?>\n<robot name="{robot_name}"><link name="base">{inert}{s}</link></robot>\n')

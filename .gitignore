@@ -2,4 +2,4 @@ generated/
 __pycache__/
 *.pyc
 pour.mp4
-venv311/
+venv311/venv/
