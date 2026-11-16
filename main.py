@@ -124,7 +124,7 @@ DEF_TGT = SimpleNamespace(lip=None, grasp=None, pad_d=None, fing_closed=None, ti
 
 def smooth(s): return s**3*(10 - 15*s + 6*s*s)
 
-def plan(src_xy, tgt_xy, S=None, T=None, flip=1, tilt_deg=None, tilt_fast_deg=58, lift=0.12, pour_dy=None, pre_back=0.09, pour_clear=None):
+def plan(src_xy, tgt_xy, S=None, T=None, flip=1, tilt_deg=None, tilt_fast_deg=45, lift=0.12, pour_dy=None, pre_back=0.09, pour_clear=None):
     """Cartesian plan (frames). Pour direction u = source->target. Cup yaw so cup +y (spout) = u.
     S/T = source/target spec objects (default: the cup and target defined above)."""
     S = S or DEF_SRC; T = T or DEF_TGT

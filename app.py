@@ -4,6 +4,15 @@ from scipy.spatial.transform import Rotation as R
 import main as M
 from containers import SPECS, write_urdf
 from perception import CamModel, perceive
+# ---- pouring accuracy tuning (these edit main.py's tables in place) ----
+M.SPEED["tilt_slow"] = (0.20, 0.30)    # slow pour: ~11 s for a glass (was ~4 s)
+M.SPEED["carry"]     = (0.35, 0.80)    # gentler transfer so water doesn't slosh out
+M.SPEED["lift"]      = (0.20, 0.60)
+M.SPEED["back"]      = (0.30, 0.80)    # untilt gently, no flinging drips
+M.FIXED_T["hold"]    = 2.5             # let the cup drain (was 1.2 s)
+POUR_CLEAR_NEW = 0.06                  # lip height above target rim (m)
+POUR_DY_K      = 0.6                   # lip offset = -POUR_DY_K * target opening radius
+
 
 LAYOUT = [("glass", 0.55, -45), ("bottle", 0.55, -15), ("glass", 0.55, 15), ("bottle", 0.55, 45)]
 RMIN, RMAX, MIN_SEP = 0.50, 0.74, 0.17
@@ -13,6 +22,8 @@ STEPS_PER_TICK = 6
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--no-viewer", action="store_true"); a = ap.parse_args()
+    # Initialize Tkinter root first so macOS NSApplication is properly configured before Genesis/GLFW
+    root = tk.Tk(); root.title("Pouring control"); root.attributes("-topmost", True)
     import genesis as gs
     M.GEN.mkdir(exist_ok=True)
     for k, S in SPECS.items(): write_urdf(M.GEN/f"{k}.urdf", S)
@@ -43,7 +54,7 @@ def main():
         items.append(dict(S=S, ent=ent, xy=xy.copy(), goal=xy.copy(), xy0=xy.copy(), hidden=False))
     # ONE liquid, built parked under the table ring (out of sight from above) until a source is chosen
     FILL = SPECS["glass"].fill
-    PARK = np.array([0.62*np.cos(np.deg2rad(135)), 0.62*np.sin(np.deg2rad(135)), FILL[2]/2 + 0.04])
+    PARK = np.array([0.90*np.cos(np.deg2rad(135)), 0.90*np.sin(np.deg2rad(135)), FILL[2]/2 + 0.01])
     liquid = scene.add_entity(morph=gs.morphs.Box(pos=tuple(PARK), size=FILL), material=gs.materials.SPH.Liquid(),
                               surface=gs.surfaces.Default(color=(0.4, 0.8, 1.0), vis_mode="particle"))
     cam_top = CamModel(scene, (640, 640), (0, 0, 2.4), (0, 0, 0), 60, up=(1, 0, 0))
@@ -100,8 +111,17 @@ def main():
         z = TOP + M.CUP_GAP + it["S"].bottom + 0.004 + FILL[2]/2
         set_particles(liquid, P0 - P0.mean(axis=0) + np.array([*it["xy"], z]))
 
+    def clear_stray(src_it):              # any water not in the source cup goes back to the parking spot
+        p = particles(liquid)
+        if p is None or P0 is None: return
+        d = np.hypot(p[:, 0] - src_it["xy"][0], p[:, 1] - src_it["xy"][1])
+        stray = d > src_it["S"].R + 0.02
+        print(f"fill check: {len(p)} particles, {stray.sum()} stray, centroid {np.round(p.mean(axis=0), 3)}, source {np.round(src_it['xy'], 3)}")
+        if stray.any():
+            p = p.copy()
+            p[stray] = P0[stray] - P0.mean(axis=0) + PARK
+            set_particles(liquid, p)
     # ---------------- GUI ----------------
-    root = tk.Tk(); root.title("Pouring control"); root.attributes("-topmost", True)
     status = tk.StringVar(value="Ready"); st = dict(mode="idle", dets=[], dirty=True)
     auto_v = tk.BooleanVar(value=True)
     lb = tk.Listbox(root, width=52, height=5); lb.pack(padx=8, pady=4)
@@ -146,16 +166,14 @@ def main():
         j = 0
         for it in items:                                      # the other two vanish immediately
             if it is not src_it and it is not tgt_it: hide(it, j); j += 1
-        status.set(f'planning ...'); root.update_idletasks()
-        try: F, Q, _ = M.make_plan(sxy, txy, S, T)
+        status.set(f'planning {ds["type"]} -> {dt["type"]} ...'); root.update_idletasks()
+        try: F, Q, _ = M.make_plan(sxy, txy, S, T, pour_dy=-POUR_DY_K*T.open_r, pour_clear=POUR_CLEAR_NEW)
         except RuntimeError as e:
             restore_hidden(); status.set(str(e)[:300]); return
         fill_source(src_it)                                   # liquid appears only now, only in the source
+        clear_stray(src_it)
         for _ in range(30): scene.step()
-        status.set(f'planning {ds["type"]} -> {dt["type"]} (IK, may take up to a minute) ...'); root.update_idletasks()
-        try: F, Q, _ = M.make_plan(sxy, txy, S, T)
-        except RuntimeError as e:
-            restore_hidden(); status.set(str(e)[:300]); return
+        clear_stray(src_it)
         n = 100; s = M.smooth(np.linspace(1/n, 1, n))[:, None]
         Qf = np.vstack([Q_PARK12 + s*(Q[0]-Q_PARK12), Q, Q[-1] + s*(Q_PARK12-Q[-1])])
         Ff = [dict(phase="unpark", attached=False)]*n + F + [dict(phase="park", attached=False)]*n
@@ -164,7 +182,7 @@ def main():
     def on_select(_=None):
         if auto_v.get() and src_v.get() and tgt_v.get():
             if src_v.get() == tgt_v.get(): status.set("pick two different objects"); return
-            root.after(50, on_start)
+            on_start()
     boxes[0].bind("<<ComboboxSelected>>", on_select); boxes[1].bind("<<ComboboxSelected>>", on_select)
 
     def finish():
@@ -204,10 +222,22 @@ def main():
                 it["xy"] = it["xy"] + d/dist*min(dist, 0.0008); put(it, (*it["xy"], TOP+M.CUP_GAP)); moving = True
         scene.step()
         if st["dirty"] and not moving: scan()
-    def tick():
-        for _ in range(STEPS_PER_TICK): step_run() if st["mode"] == "run" else step_idle()
-        root.after(1, tick)
-    root.after(100, tick); root.mainloop()
+    running = True
+    def on_close():
+        nonlocal running
+        running = False
+        try: root.destroy()
+        except Exception: pass
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    scan()
+    while running:
+        try:
+            root.update()
+        except tk.TclError:
+            break
+        for _ in range(STEPS_PER_TICK):
+            step_run() if st["mode"] == "run" else step_idle()
 
 if __name__ == "__main__":
     main()
