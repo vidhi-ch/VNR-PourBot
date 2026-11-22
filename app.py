@@ -69,8 +69,35 @@ def main():
         if d is None: d = robot.get_joint(n).dof_idx_local
         return int(d[0] if hasattr(d, "__len__") else d)
     dofs = [_dof(n) for n in names]
-    set_q = lambda q: robot.set_dofs_position(np.asarray(q, dtype=np.float32), dofs_idx_local=dofs)
+    arm_dofs, grip_dofs = dofs[:6], dofs[6:]
     Q_PARK12 = np.concatenate([Q_PARK, M.gripper_q(0.0)])
+
+    # Match the arm PID settings used by main.py. The GUI scene uses dt=4 ms,
+    # which matches M.SIM_DT. The gripper remains under Genesis position control.
+    pid = JointPID(
+        kp=M.PID_KP,
+        ki=M.PID_KI,
+        kd=M.PID_KD,
+        dt=M.SIM_DT,
+        tau_max=M.TAU_MAX,
+    )
+    robot.set_dofs_kp(np.full(len(grip_dofs), 500.0), dofs_idx_local=grip_dofs)
+    robot.set_dofs_kv(np.full(len(grip_dofs), 30.0), dofs_idx_local=grip_dofs)
+    robot.set_dofs_force_range(-M.TAU_MAX, M.TAU_MAX, dofs_idx_local=arm_dofs)
+
+    def _np(value):
+        return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+    def drive(q_ref12, qd_ref=None):
+        """Torque-PID control for UR5 arm; position control for gripper."""
+        q = _np(robot.get_dofs_position(dofs_idx_local=arm_dofs)).astype(float).ravel()
+        qd = _np(robot.get_dofs_velocity(dofs_idx_local=arm_dofs)).astype(float).ravel()
+        if qd_ref is None:
+            qd_ref = np.zeros(6, dtype=float)
+        tau = pid(q_ref12[:6], q, qd, qd_ref)
+        robot.control_dofs_force(np.asarray(tau, dtype=np.float32), dofs_idx_local=arm_dofs)
+        robot.control_dofs_position(np.asarray(q_ref12[6:], dtype=np.float32), dofs_idx_local=grip_dofs)
+        return q_ref12[:6] - q
     def put(it, O, Rc=np.eye(3)):
         x, y, z, w = R.from_matrix(Rc).as_quat()
         it["ent"].set_pos(np.asarray(O, dtype=np.float32), zero_velocity=True)
@@ -177,6 +204,7 @@ def main():
         n = 100; s = M.smooth(np.linspace(1/n, 1, n))[:, None]
         Qf = np.vstack([Q_PARK12 + s*(Q[0]-Q_PARK12), Q, Q[-1] + s*(Q_PARK12-Q[-1])])
         Ff = [dict(phase="unpark", attached=False)]*n + F + [dict(phase="park", attached=False)]*n
+        pid.reset()
         st.update(mode="run", i=0, Q=Qf, F=Ff, src=src_it, tgt=tgt_it)
 
     def on_select(_=None):
@@ -193,7 +221,7 @@ def main():
         status.set(f"done | in target {100*tx.mean():.0f}% | left in source {100*sx.mean():.0f}% | spilled {100*(1-tx.mean()-sx.mean()):.0f}%  | press Reset to restore all containers")
 
     def on_reset():
-        scene.reset(); st["mode"] = "idle"; st["dirty"] = True
+        scene.reset(); pid.reset(); st["mode"] = "idle"; st["dirty"] = True
         if P0 is not None: set_particles(liquid, P0)
         for it in items:
             it["hidden"] = False; it["psave"] = None
@@ -208,13 +236,15 @@ def main():
 
     # ---------------- stepping ----------------
     def step_run():
-        i = st["i"]; f = st["F"][i]; set_q(st["Q"][i])
+        i = st["i"]; f = st["F"][i]
+        qd_ref = (st["Q"][i, :6] - st["Q"][i-1, :6]) / M.SIM_DT if i > 0 else np.zeros(6)
+        drive(st["Q"][i], qd_ref)
         if f.get("attached"): put(st["src"], *f["cup"])          # virtual weld while gripped
         scene.step(); st["i"] += 1
         if i % 100 == 0: status.set(f'{f["phase"]}  {100*i//len(st["Q"])}%')
         if st["i"] >= len(st["Q"]): finish()
     def step_idle():
-        set_q(Q_PARK12); moving = False
+        drive(Q_PARK12); moving = False
         for it in items:
             if it["hidden"]: continue
             d = it["goal"] - it["xy"]; dist = np.linalg.norm(d)  # glide to goal at <= 0.8 mm per step
