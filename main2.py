@@ -43,7 +43,7 @@ SPEED = dict(
     retreat   = (0.20, 0.8),
 )
 FIXED_T = dict(settle=0.4, to_pre=1.2, close=0.32, hold=1.2, open=0.32)   # seconds
-
+META = {}
 def n_frames(L, v, a):
     """minimum-jerk duration of a move of length L limited by speed v and accel a -> frame count"""
     T = max(1.875*L/v, np.sqrt(5.77*L/a)) if L > 1e-9 else 0.0
@@ -210,6 +210,8 @@ def plan(src_xy, tgt_xy, S=None, T=None, flip=1, tilt_deg=None, tilt_fast_deg=50
     for i in range(n["open"]): add("open", O_src, I, fing_closed + smooth((i+1)/n["open"])*(FING_OPEN-fing_closed), False)
     for i in range(n["retreat"]): add("retreat", O_src, I, FING_OPEN, False, pre_back*smooth((i+1)/n["retreat"]))
     for i in range(n["rise"]): add("rise", O_src, I, FING_OPEN, False, pre_back, rise*smooth((i+1)/n["rise"]))
+    META.clear(); META.update(I=I, lip=lip, grasp=grasp, pad_d=pad_d, R_CUP_G=R_CUP_G, u=u, pour_dy=pour_dy,
+                              pc=pour_clear, th_c=th_c, th_max=th_max, tgt_xy=tgt_xy)
     return F
 
 def _best_ik(Rt, pt, seeds=40):

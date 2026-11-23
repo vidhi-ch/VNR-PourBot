@@ -1,6 +1,7 @@
 import argparse, numpy as np, tkinter as tk, torch
 from tkinter import ttk
 from scipy.spatial.transform import Rotation as R
+from controller import JointPID
 import main as M
 from containers import SPECS, write_urdf
 from perception import CamModel, perceive
